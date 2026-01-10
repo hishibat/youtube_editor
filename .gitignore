@@ -1,0 +1,44 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+.venv/
+*.egg-info/
+dist/
+build/
+
+# Node
+node_modules/
+npm-debug.log*
+
+# Generated files
+backend/uploads/
+backend/outputs/
+*.mp4
+*.avi
+*.mov
+*.webm
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Playwright screenshots
+.playwright-mcp/
+
+# Environment
+.env
+.env.local
+
+# Test files
+backend/test_video*.mp4
