@@ -1,18 +1,66 @@
 """
 SAM 2 (Segment Anything Model 2) ベースの動画マッティングサービス
 
-ギター演奏動画の高精度背景除去に特化
-- ポイント指定型追跡（人物+ギター）
-- Hough変換によるギター指板保護
-- オプティカルフローによる振動検知
+プロ仕様のビデオセグメンテーション:
+- ストローク（線）による密な空間情報入力
+- VideoPredictor によるキーフレーム伝播
+- Guided Filter によるアルファマッティング（エッジ精緻化）
+- base_plus モデルによる高品質セグメンテーション
 """
 
 import os
 import cv2
 import numpy as np
 import torch
-from typing import Optional, Tuple, List, Dict, Any
+from typing import Optional, Tuple, List, Dict, Any, Callable
 from pathlib import Path
+
+
+def guided_filter(guide: np.ndarray, src: np.ndarray, radius: int = 8, eps: float = 0.01) -> np.ndarray:
+    """
+    Guided Filter によるアルファマッティング精緻化
+
+    二値マスクのエッジを滑らかにし、髪の毛やギター弦のような
+    細い部分を半透明境界として表現する。
+
+    Args:
+        guide: ガイド画像（元のBGR画像をグレースケール化したもの）
+        src: ソース画像（二値マスク、0-1の範囲）
+        radius: フィルタ半径
+        eps: 正則化パラメータ
+
+    Returns:
+        精緻化されたアルファマット（0-1の範囲）
+    """
+    guide = guide.astype(np.float64)
+    src = src.astype(np.float64)
+
+    if len(guide.shape) == 3:
+        guide = cv2.cvtColor(guide.astype(np.uint8), cv2.COLOR_BGR2GRAY).astype(np.float64)
+
+    guide = guide / 255.0
+
+    # Box filter
+    def box_filter(img, r):
+        return cv2.blur(img, (2*r+1, 2*r+1))
+
+    mean_guide = box_filter(guide, radius)
+    mean_src = box_filter(src, radius)
+    corr_guide = box_filter(guide * guide, radius)
+    corr_guide_src = box_filter(guide * src, radius)
+
+    var_guide = corr_guide - mean_guide * mean_guide
+    cov_guide_src = corr_guide_src - mean_guide * mean_src
+
+    a = cov_guide_src / (var_guide + eps)
+    b = mean_src - a * mean_guide
+
+    mean_a = box_filter(a, radius)
+    mean_b = box_filter(b, radius)
+
+    output = mean_a * guide + mean_b
+
+    return np.clip(output, 0, 1)
 
 
 class SAM2VideoMattingService:
@@ -37,6 +85,7 @@ class SAM2VideoMattingService:
 
         # SAM 2 関連
         self.predictor = None
+        self.video_predictor = None
         self.video_state = None
 
         # ポイント追跡用
@@ -115,6 +164,57 @@ class SAM2VideoMattingService:
             traceback.print_exc()
             print("Falling back to simple implementation...")
             self.predictor = None
+            raise
+
+    def _load_video_predictor(self):
+        """SAM 2 VideoPredictor を遅延読み込み"""
+        if self.video_predictor is not None:
+            return
+
+        print(f"Loading SAM 2 VideoPredictor ({self.model_size})...")
+
+        try:
+            from sam2.build_sam import build_sam2_video_predictor
+            from huggingface_hub import hf_hub_download
+
+            # モデルサイズに応じた設定
+            model_configs = {
+                "tiny": ("facebook/sam2-hiera-tiny", "sam2_hiera_tiny.pt", "sam2_hiera_t.yaml"),
+                "small": ("facebook/sam2-hiera-small", "sam2_hiera_small.pt", "sam2_hiera_s.yaml"),
+                "base_plus": ("facebook/sam2-hiera-base-plus", "sam2_hiera_base_plus.pt", "sam2_hiera_b+.yaml"),
+                "large": ("facebook/sam2-hiera-large", "sam2_hiera_large.pt", "sam2_hiera_l.yaml"),
+            }
+
+            repo_id, ckpt_name, config_name = model_configs.get(self.model_size, model_configs["large"])
+
+            # チェックポイントをダウンロード
+            checkpoint_path = hf_hub_download(repo_id=repo_id, filename=ckpt_name)
+
+            # SAM 2のインストールパスからconfig取得
+            import sam2
+            sam2_path = Path(sam2.__file__).parent
+            config_path = sam2_path / "configs" / "sam2" / config_name
+
+            if not config_path.exists():
+                config_path = sam2_path / "sam2_configs" / config_name
+
+            print(f"VideoPredictor Checkpoint: {checkpoint_path}")
+            print(f"VideoPredictor Config: {config_path}")
+
+            # SAM 2 VideoPredictor を構築
+            self.video_predictor = build_sam2_video_predictor(
+                str(config_path),
+                checkpoint_path,
+                device=self.device
+            )
+
+            print("SAM 2 VideoPredictor loaded successfully.")
+
+        except Exception as e:
+            print(f"Failed to load SAM 2 VideoPredictor: {e}")
+            import traceback
+            traceback.print_exc()
+            self.video_predictor = None
             raise
 
     def detect_guitar_neck_lines(self, frame: np.ndarray) -> np.ndarray:
@@ -361,8 +461,9 @@ class SAM2VideoMattingService:
         frame: np.ndarray,
         foreground_points: Optional[List[Tuple[int, int]]] = None,
         background_points: Optional[List[Tuple[int, int]]] = None,
-        protect_guitar_neck: bool = True,
-        use_vibration_detection: bool = True
+        protect_guitar_neck: bool = False,  # デフォルトOFF（ストローク指定時は不要）
+        use_vibration_detection: bool = False,  # デフォルトOFF
+        use_guided_filter: bool = True  # アルファマッティング
     ) -> np.ndarray:
         """
         単一フレームを処理してBGRA画像を返す
@@ -373,14 +474,19 @@ class SAM2VideoMattingService:
             background_points: 背景ポイント（None=自動検出）
             protect_guitar_neck: ギターネックを保護するか
             use_vibration_detection: 振動検知を使用するか
+            use_guided_filter: Guided Filterによるエッジ精緻化
 
         Returns:
             BGRA画像（アルファチャンネル付き）
         """
         h, w = frame.shape[:2]
 
-        # ポイントの自動検出
-        if foreground_points is None or background_points is None:
+        # ユーザーがポイントを指定している場合は自動検出しない
+        has_user_points = (foreground_points and len(foreground_points) > 0) or \
+                         (background_points and len(background_points) > 0)
+
+        if not has_user_points:
+            # ポイントの自動検出
             auto_fg, auto_bg = self.auto_detect_prompt_points(frame)
             foreground_points = foreground_points or auto_fg
             background_points = background_points or auto_bg
@@ -388,42 +494,43 @@ class SAM2VideoMattingService:
         # SAM 2でセグメンテーション
         try:
             self._load_model()
-            mask = self._segment_with_sam2(frame, foreground_points, background_points)
+            mask = self._segment_with_sam2(frame, foreground_points or [], background_points or [])
         except Exception as e:
             print(f"SAM 2 segmentation failed: {e}")
             # フォールバック：簡易セグメンテーション
             mask = self._fallback_segmentation(frame)
 
-        # ギターネック保護
+        # Guided Filter によるアルファマッティング（エッジ精緻化）
+        if use_guided_filter:
+            # 0-255 を 0-1 に正規化
+            mask_normalized = mask.astype(np.float64) / 255.0
+
+            # Guided Filter 適用
+            refined_mask = guided_filter(
+                guide=frame,
+                src=mask_normalized,
+                radius=12,  # 大きめの半径でより滑らかに
+                eps=0.001   # 小さいepsでエッジを保持
+            )
+
+            # 0-1 を 0-255 に戻す
+            mask = (refined_mask * 255).astype(np.uint8)
+
+        # ギターネック保護（オプション）
         if protect_guitar_neck:
             neck_protection = self.detect_guitar_neck_lines(frame)
-            # 保護領域をマスクに追加
             mask = np.maximum(mask, neck_protection)
 
-        # 振動検知による静止物体除去
+        # 振動検知（オプション）
         if use_vibration_detection:
             vibration_mask = self.detect_vibration_regions(frame, threshold=0.2)
-            # 振動がない領域はマスクから除去（ただし保護領域は除く）
             static_region = cv2.bitwise_not(vibration_mask)
             if protect_guitar_neck:
-                # ギターネック保護領域は静止でも除去しない
                 static_region = cv2.bitwise_and(static_region, cv2.bitwise_not(neck_protection))
-
-            # 静止領域をマスクから減算（90%抑制）
             mask_float = mask.astype(np.float32)
             static_float = static_region.astype(np.float32) / 255.0
             mask_float = mask_float * (1 - static_float * 0.9)
             mask = mask_float.astype(np.uint8)
-
-        # 強制的に右側30%を背景化（椅子対策の最終手段）
-        right_exclusion_start = int(w * 0.75)
-        right_mask = np.ones((h, w), dtype=np.float32)
-        # グラデーションで自然に除去
-        for x in range(right_exclusion_start, w):
-            ratio = (x - right_exclusion_start) / (w - right_exclusion_start)
-            right_mask[:, x] = 1 - ratio * 0.95
-
-        mask = (mask.astype(np.float32) * right_mask).astype(np.uint8)
 
         # BGRA画像を作成
         bgra = cv2.cvtColor(frame, cv2.COLOR_BGR2BGRA)
@@ -636,6 +743,169 @@ class SAM2VideoMattingService:
         composite = (fg_bgr * alpha + bg_float * (1 - alpha)).astype(np.uint8)
 
         return composite
+
+    def process_video_with_propagation(
+        self,
+        frames: List[np.ndarray],
+        foreground_points: List[Tuple[int, int]] = None,
+        background_points: List[Tuple[int, int]] = None,
+        progress_callback: Optional[Callable[[int, int, str], None]] = None
+    ) -> List[np.ndarray]:
+        """
+        SAM 2 VideoPredictor を使用して動画全体のマスクを伝播
+
+        最初のフレームでユーザー指定のポイントからマスクを生成し、
+        propagate_in_video で全フレームに伝播させる。
+
+        Args:
+            frames: フレームのリスト（BGR画像）
+            foreground_points: 前景ポイント（ピクセル座標）
+            background_points: 背景ポイント（ピクセル座標）
+            progress_callback: 進捗コールバック (current, total, status)
+
+        Returns:
+            BGRA画像のリスト
+        """
+        if not frames:
+            return []
+
+        total_frames = len(frames)
+        results = []
+
+        # ポイントが指定されていない場合は自動検出
+        if not foreground_points and not background_points:
+            foreground_points, background_points = self.auto_detect_prompt_points(frames[0])
+
+        print(f"Processing {total_frames} frames with SAM 2 VideoPredictor")
+        print(f"Foreground points: {foreground_points}")
+        print(f"Background points: {background_points}")
+
+        try:
+            # SAM 2 VideoPredictor を読み込み
+            self._load_video_predictor()
+
+            if self.video_predictor is None:
+                raise Exception("VideoPredictor not available")
+
+            # 一時ディレクトリにフレームを保存
+            import tempfile
+            import os
+
+            with tempfile.TemporaryDirectory() as temp_dir:
+                # フレームをJPEGとして保存
+                if progress_callback:
+                    progress_callback(0, total_frames, "フレーム準備中")
+
+                frame_paths = []
+                for i, frame in enumerate(frames):
+                    frame_rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
+                    frame_path = os.path.join(temp_dir, f"{i:06d}.jpg")
+                    cv2.imwrite(frame_path, cv2.cvtColor(frame_rgb, cv2.COLOR_RGB2BGR))
+                    frame_paths.append(frame_path)
+
+                h, w = frames[0].shape[:2]
+
+                # VideoPredictor に動画を設定
+                if progress_callback:
+                    progress_callback(0, total_frames, "SAM 2 VideoPredictor 初期化中")
+
+                with torch.inference_mode():
+                    # 動画の状態を初期化
+                    inference_state = self.video_predictor.init_state(video_path=temp_dir)
+
+                    # 最初のフレームにプロンプトポイントを追加
+                    all_points = []
+                    all_labels = []
+
+                    for point in (foreground_points or []):
+                        all_points.append(list(point))
+                        all_labels.append(1)  # 1 = foreground
+
+                    for point in (background_points or []):
+                        all_points.append(list(point))
+                        all_labels.append(0)  # 0 = background
+
+                    if all_points:
+                        points_array = np.array(all_points, dtype=np.float32)
+                        labels_array = np.array(all_labels, dtype=np.int32)
+
+                        # フレーム0にポイントを追加
+                        _, out_obj_ids, out_mask_logits = self.video_predictor.add_new_points_or_box(
+                            inference_state=inference_state,
+                            frame_idx=0,
+                            obj_id=1,  # オブジェクトID
+                            points=points_array,
+                            labels=labels_array,
+                        )
+
+                    if progress_callback:
+                        progress_callback(0, total_frames, "マスク伝播中")
+
+                    # propagate_in_video で全フレームにマスクを伝播
+                    video_segments = {}
+                    for out_frame_idx, out_obj_ids, out_mask_logits in self.video_predictor.propagate_in_video(inference_state):
+                        # マスクを取得
+                        mask = (out_mask_logits[0] > 0.0).cpu().numpy().squeeze()
+                        video_segments[out_frame_idx] = mask
+
+                        if progress_callback and (out_frame_idx + 1) % 10 == 0:
+                            progress_callback(out_frame_idx + 1, total_frames, f"マスク伝播中: {out_frame_idx + 1}/{total_frames}")
+
+                    # 結果を生成
+                    if progress_callback:
+                        progress_callback(0, total_frames, "BGRA変換中")
+
+                    for i, frame in enumerate(frames):
+                        if i in video_segments:
+                            mask = video_segments[i]
+                            # マスクのサイズをフレームに合わせる
+                            if mask.shape != (h, w):
+                                mask = cv2.resize(mask.astype(np.float32), (w, h)) > 0.5
+
+                            # 0-1 を 0-255 に変換
+                            alpha = (mask * 255).astype(np.uint8)
+
+                            # ギターネック保護を適用
+                            neck_protection = self.detect_guitar_neck_lines(frame)
+                            alpha = np.maximum(alpha, neck_protection)
+                        else:
+                            # マスクがない場合は全透明
+                            alpha = np.zeros((h, w), dtype=np.uint8)
+
+                        # BGRA画像を作成
+                        bgra = cv2.cvtColor(frame, cv2.COLOR_BGR2BGRA)
+                        bgra[:, :, 3] = alpha
+                        results.append(bgra)
+
+                        if progress_callback and (i + 1) % 10 == 0:
+                            progress_callback(i + 1, total_frames, f"BGRA変換中: {i + 1}/{total_frames}")
+
+                    # リソース解放
+                    self.video_predictor.reset_state(inference_state)
+
+        except Exception as e:
+            print(f"VideoPredictor processing failed: {e}")
+            import traceback
+            traceback.print_exc()
+
+            # フォールバック: フレームごとに処理
+            print("Falling back to per-frame processing...")
+            for i, frame in enumerate(frames):
+                if i == 0:
+                    bgra = self.process_single_frame(
+                        frame,
+                        foreground_points=foreground_points,
+                        background_points=background_points
+                    )
+                else:
+                    bgra = self.process_single_frame(frame)
+
+                results.append(bgra)
+
+                if progress_callback and (i + 1) % 10 == 0:
+                    progress_callback(i + 1, total_frames, f"処理中（フォールバック）: {i + 1}/{total_frames}")
+
+        return results
 
     def reset(self):
         """状態をリセット"""

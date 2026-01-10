@@ -114,6 +114,7 @@ class VideoProcessor:
         background_path: str = None,
         background_bytes: bytes = None,
         progress_callback: Optional[Callable[[int, int, str], None]] = None,
+        strokes_json: str = None,
     ) -> None:
         """
         動画全体を処理して背景を差し替え（高速化版）
@@ -125,7 +126,10 @@ class VideoProcessor:
             background_path: 背景ファイルパス
             background_bytes: 背景バイトデータ
             progress_callback: 進捗コールバック (current, total, status)
+            strokes_json: ユーザー指定のストローク（JSON文字列）
         """
+        import json
+
         cap = cv2.VideoCapture(input_path)
 
         if not cap.isOpened():
@@ -134,6 +138,10 @@ class VideoProcessor:
         # RVMの時間的状態をリセット（新しい動画の開始）
         if hasattr(bg_removal_service, 'reset_temporal_state'):
             bg_removal_service.reset_temporal_state()
+
+        # SAM 2の状態をリセット
+        if hasattr(bg_removal_service, 'reset'):
+            bg_removal_service.reset()
 
         try:
             width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
@@ -167,51 +175,152 @@ class VideoProcessor:
             processed_count = 0
             last_fg_frame = None
 
+            # ユーザー指定のストロークを解析
+            foreground_points = None
+            background_points = None
+
+            if strokes_json:
+                try:
+                    strokes_data = json.loads(strokes_json)
+                    foreground_points = []
+                    background_points = []
+
+                    for stroke in strokes_data:
+                        stroke_type = stroke.get('type', 'foreground')
+                        points = stroke.get('points', [])
+
+                        # ストロークの全ポイントを追加（密な空間情報）
+                        for point in points:
+                            px = int(point['x'] * width / 100)
+                            py = int(point['y'] * height / 100)
+
+                            if stroke_type == 'foreground':
+                                foreground_points.append((px, py))
+                            else:
+                                background_points.append((px, py))
+
+                    print(f"Strokes: {len(foreground_points)} FG points, {len(background_points)} BG points")
+                except Exception as e:
+                    print(f"Failed to parse strokes: {e}")
+
             if progress_callback:
                 progress_callback(0, total_frames, "処理開始")
 
-            while True:
-                ret, frame = cap.read()
-                if not ret:
-                    break
+            # ストロークデータを解析
+            strokes_data_list = None
+            if strokes_json:
+                try:
+                    strokes_data_list = json.loads(strokes_json)
+                except:
+                    pass
 
-                # 背景動画の場合、フレームを更新
-                if bg_cap is not None:
-                    bg_ret, bg_video_frame = bg_cap.read()
-                    if not bg_ret:
-                        bg_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
-                        _, bg_video_frame = bg_cap.read()
-                    bg_frame = cv2.resize(bg_video_frame, (width, height))
+            # VideoPredictor（ProMatting含む）を使用するか確認
+            use_video_predictor = (
+                hasattr(bg_removal_service, 'process_video_with_propagation') and
+                (foreground_points or background_points)
+            )
 
-                # フレームスキップ: N フレームごとに背景除去を実行
-                if frame_count % self.frame_skip == 0:
-                    # 背景除去（高速版を使用）
-                    fg_frame = bg_removal_service.remove_background(frame)
-                    last_fg_frame = fg_frame
-                    processed_count += 1
-                else:
-                    # スキップしたフレームは前のフレームのマスクを再利用
-                    if last_fg_frame is not None:
-                        # 現在のフレームに前のマスクを適用
-                        alpha = last_fg_frame[:, :, 3:4]
-                        fg_frame = np.dstack([frame, alpha[:, :, 0]])
-                    else:
-                        fg_frame = bg_removal_service.remove_background(frame)
+            if use_video_predictor:
+                # ProMatting / SAM 2 VideoPredictor による一括処理
+                if progress_callback:
+                    progress_callback(0, total_frames, "VFXグレード マッティング初期化中")
+
+                # 全フレームを読み込み
+                frames = []
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+                    frames.append(frame)
+
+                if progress_callback:
+                    progress_callback(0, len(frames), "VFXグレード マッティング処理中")
+
+                # VideoPredictor / ProMatting でマスク伝播処理
+                def matting_progress_callback(current, total, status):
+                    if progress_callback:
+                        progress_callback(current, total, status)
+
+                # ストロークデータも渡す
+                fg_frames = bg_removal_service.process_video_with_propagation(
+                    frames,
+                    foreground_points=foreground_points,
+                    background_points=background_points,
+                    strokes=strokes_data_list,
+                    progress_callback=matting_progress_callback
+                )
+
+                # 合成と出力
+                for i, fg_frame in enumerate(fg_frames):
+                    # 背景動画の場合、フレームを更新
+                    if bg_cap is not None:
+                        bg_ret, bg_video_frame = bg_cap.read()
+                        if not bg_ret:
+                            bg_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                            _, bg_video_frame = bg_cap.read()
+                        bg_frame = cv2.resize(bg_video_frame, (width, height))
+
+                    composite = self.composite_frames(fg_frame, bg_frame)
+                    out.write(composite)
+
+                    if progress_callback and (i + 1) % 10 == 0:
+                        progress_callback(i + 1, len(fg_frames), f"合成中: {i + 1}/{len(fg_frames)}")
+
+                frame_count = len(frames)
+            else:
+                # 従来のフレームごと処理
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+
+                    # 背景動画の場合、フレームを更新
+                    if bg_cap is not None:
+                        bg_ret, bg_video_frame = bg_cap.read()
+                        if not bg_ret:
+                            bg_cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+                            _, bg_video_frame = bg_cap.read()
+                        bg_frame = cv2.resize(bg_video_frame, (width, height))
+
+                    # フレームスキップ: N フレームごとに背景除去を実行
+                    if frame_count % self.frame_skip == 0:
+                        # 最初のフレームはユーザー指定ポイントを使用
+                        if frame_count == 0 and (foreground_points or background_points):
+                            if hasattr(bg_removal_service, 'process_single_frame'):
+                                fg_frame = bg_removal_service.process_single_frame(
+                                    frame,
+                                    foreground_points=foreground_points,
+                                    background_points=background_points
+                                )
+                            else:
+                                fg_frame = bg_removal_service.remove_background(frame)
+                        else:
+                            fg_frame = bg_removal_service.remove_background(frame)
                         last_fg_frame = fg_frame
+                        processed_count += 1
+                    else:
+                        # スキップしたフレームは前のフレームのマスクを再利用
+                        if last_fg_frame is not None:
+                            # 現在のフレームに前のマスクを適用
+                            alpha = last_fg_frame[:, :, 3:4]
+                            fg_frame = np.dstack([frame, alpha[:, :, 0]])
+                        else:
+                            fg_frame = bg_removal_service.remove_background(frame)
+                            last_fg_frame = fg_frame
 
-                # 合成
-                composite = self.composite_frames(fg_frame, bg_frame)
-                out.write(composite)
+                    # 合成
+                    composite = self.composite_frames(fg_frame, bg_frame)
+                    out.write(composite)
 
-                frame_count += 1
+                    frame_count += 1
 
-                # 進捗通知（10フレームごと）
-                if progress_callback and frame_count % 10 == 0:
-                    progress_callback(
-                        frame_count,
-                        total_frames,
-                        f"処理中: {frame_count}/{total_frames}"
-                    )
+                    # 進捗通知（10フレームごと）
+                    if progress_callback and frame_count % 10 == 0:
+                        progress_callback(
+                            frame_count,
+                            total_frames,
+                            f"処理中: {frame_count}/{total_frames}"
+                        )
 
             out.release()
             if bg_cap:
