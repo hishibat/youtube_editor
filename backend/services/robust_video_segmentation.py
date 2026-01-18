@@ -38,30 +38,43 @@ class MaskPostProcessor:
     - Morphological Operations（細いパーツを保護）
     - Connected Component Analysis（接続成分を保護）
     - Temporal Smoothing（フリッカー除去）
+    - Guided Filter（エッジ精緻化）
     """
 
     def __init__(self, buffer_size: int = 5):
         self.buffer_size = buffer_size
         self.mask_buffer: deque = deque(maxlen=buffer_size)
+        # Guided Filter が使えるか確認
+        self.has_ximgproc = hasattr(cv2, 'ximgproc')
+        if self.has_ximgproc:
+            print("  Guided Filter: available (opencv-contrib)")
+        else:
+            print("  Guided Filter: NOT available (using fallback)")
 
     def apply_morphological_ops(
         self,
         mask: np.ndarray,
-        close_kernel_size: int = 5,
-        dilate_kernel_size: int = 3,
-        dilate_iterations: int = 1
+        close_kernel_size: int = 15,  # 増加: ギター指板の穴を埋める
+        dilate_kernel_size: int = 5,   # 増加: 細いパーツ保護
+        dilate_iterations: int = 2     # 増加: より強い保護
     ) -> np.ndarray:
         """
         Morphological操作を適用
 
-        - Closing: 小さな穴を埋める（ギターの弦の隙間など）
+        - Closing: 小さな穴を埋める（ギターの弦の隙間、フレット間など）
         - Dilation: エッジを少し膨張（細いパーツが消えるのを防ぐ）
         """
-        # Closing（穴埋め）
+        # 複数回のClosing（穴埋め強化）
         close_kernel = cv2.getStructuringElement(
             cv2.MORPH_ELLIPSE, (close_kernel_size, close_kernel_size)
         )
-        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel)
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, close_kernel, iterations=2)
+
+        # 小さい穴も埋める
+        small_close_kernel = cv2.getStructuringElement(
+            cv2.MORPH_ELLIPSE, (7, 7)
+        )
+        mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, small_close_kernel, iterations=1)
 
         # 軽いDilation（細いパーツ保護）
         dilate_kernel = cv2.getStructuringElement(
@@ -71,14 +84,60 @@ class MaskPostProcessor:
 
         return mask
 
+    def apply_guided_filter(
+        self,
+        mask: np.ndarray,
+        guide_image: Optional[np.ndarray] = None,
+        radius: int = 8,
+        eps: float = 0.01
+    ) -> np.ndarray:
+        """
+        Guided Filterでエッジを精緻化
+
+        Args:
+            mask: 入力マスク (0-255)
+            guide_image: ガイド画像（元フレーム、Noneの場合は自己ガイド）
+            radius: フィルタ半径
+            eps: 正則化パラメータ
+        """
+        if not self.has_ximgproc:
+            # フォールバック: Bilateral Filter
+            return cv2.bilateralFilter(mask, 9, 75, 75)
+
+        mask_float = mask.astype(np.float32) / 255.0
+
+        if guide_image is not None:
+            # カラーガイド画像を使用
+            if len(guide_image.shape) == 3:
+                guide = cv2.cvtColor(guide_image, cv2.COLOR_BGR2GRAY)
+            else:
+                guide = guide_image
+            guide_float = guide.astype(np.float32) / 255.0
+        else:
+            # 自己ガイド
+            guide_float = mask_float
+
+        # Guided Filter適用
+        filtered = cv2.ximgproc.guidedFilter(
+            guide_float, mask_float, radius, eps
+        )
+
+        return np.clip(filtered * 255, 0, 255).astype(np.uint8)
+
     def protect_connected_components(
         self,
         mask: np.ndarray,
-        min_area_ratio: float = 0.001
+        min_area_ratio: float = 0.005,  # 増加: より厳しいノイズ除去
+        keep_only_largest: bool = False  # 最大成分のみを保持
     ) -> np.ndarray:
         """
         接続成分解析で小さなノイズを除去しつつ、
         主要な物体に接続された部分を保護
+
+        Args:
+            mask: 入力マスク
+            min_area_ratio: 最小面積比率（これ以下は除去）
+            keep_only_largest: Trueの場合、最大の連結成分のみを保持
         """
         h, w = mask.shape
         min_area = int(h * w * min_area_ratio)
@@ -101,13 +160,21 @@ class MaskPostProcessor:
             return mask
 
         max_area = np.max(areas)
+        max_label = np.argmax(areas) + 1  # +1 because background is 0
 
-        # 最大成分の一定割合以上の成分を保持
         result = np.zeros_like(mask)
-        for i in range(1, num_labels):
-            area = stats[i, cv2.CC_STAT_AREA]
-            if area >= min_area or area >= max_area * 0.1:
-                result[labels == i] = 255
+
+        if keep_only_largest:
+            # 最大の成分のみを保持（ギター演奏者のみを抽出）
+            result[labels == max_label] = 255
+        else:
+            # 最大成分の一定割合以上の成分を保持
+            # ただし、閾値を厳しくして小さな残骸を除去
+            for i in range(1, num_labels):
+                area = stats[i, cv2.CC_STAT_AREA]
+                # 最大成分の20%以上、または最小面積以上
+                if area >= max_area * 0.20 or (area >= min_area and area >= max_area * 0.05):
+                    result[labels == i] = 255
 
         return result
 
@@ -144,15 +211,44 @@ class MaskPostProcessor:
 
         return np.clip(smoothed, 0, 255).astype(np.uint8)
 
-    def process(self, mask: np.ndarray) -> np.ndarray:
+    def apply_edge_margin(
+        self,
+        mask: np.ndarray,
+        margin_ratio: float = 0.15  # 端から15%をマスクから除外
+    ) -> np.ndarray:
+        """
+        画像の端（特に右側）をマスクから除外
+
+        ギター演奏動画では、右側に椅子/機材が映り込むことが多いため、
+        画像の右端をマスクから除外する
+        """
+        h, w = mask.shape
+        result = mask.copy()
+
+        # 右端をフェードアウト（椅子/機材を除去）
+        right_margin = int(w * margin_ratio)
+        for i in range(right_margin):
+            alpha = i / right_margin  # 0 -> 1 のグラデーション
+            x = w - right_margin + i
+            result[:, x] = (result[:, x].astype(np.float32) * alpha).astype(np.uint8)
+
+        return result
+
+    def process(self, mask: np.ndarray, guide_image: Optional[np.ndarray] = None) -> np.ndarray:
         """全ての後処理を適用"""
-        # 1. Morphological操作
+        # 1. Morphological操作（穴埋め、細部保護）
         mask = self.apply_morphological_ops(mask)
 
-        # 2. 接続成分解析
+        # 2. 接続成分解析（ノイズ除去）
         mask = self.protect_connected_components(mask)
 
-        # 3. 時間的平滑化
+        # 3. エッジマージン（右端を除外）
+        mask = self.apply_edge_margin(mask, margin_ratio=0.12)
+
+        # 4. Guided Filter（エッジ精緻化）
+        mask = self.apply_guided_filter(mask, guide_image)
+
+        # 5. 時間的平滑化（フリッカー除去）
         mask = self.temporal_smooth(mask)
 
         return mask
@@ -167,21 +263,35 @@ class RobustVideoSegmentation:
     堅牢なビデオセグメンテーションサービス
 
     SAM 2 VideoPredictor を使用した時間的一貫性のあるセグメンテーション
+
+    改善点:
+    - CPU上では軽量モデル（small）をデフォルトで使用
+    - Guided Filterでエッジを滑らかに
+    - 強化されたMorphological操作でギター指板の穴を埋める
     """
 
     def __init__(
         self,
         device: Optional[str] = None,
-        model_size: str = "large"
+        model_size: str = "auto"  # "auto" = CPU: small, GPU: large
     ):
         self.device = device or ("cuda" if torch.cuda.is_available() else "cpu")
-        self.model_size = model_size
+
+        # CPU上では軽量モデルを使用（速度優先）
+        if model_size == "auto":
+            if self.device == "cpu":
+                self.model_size = "small"  # CPU: 軽量モデル
+                print("  Note: Using 'small' model for CPU (faster)")
+            else:
+                self.model_size = "large"  # GPU: 高品質モデル
+        else:
+            self.model_size = model_size
 
         # SAM 2 関連
         self.sam2_predictor = None
         self.video_predictor = None
 
-        # 後処理
+        # 後処理（強化版）
         self.post_processor = MaskPostProcessor(buffer_size=5)
 
         # FFmpeg
@@ -190,7 +300,7 @@ class RobustVideoSegmentation:
 
         print(f"RobustVideoSegmentation initialized")
         print(f"  Device: {self.device}")
-        print(f"  Model: sam2_hiera_{model_size}")
+        print(f"  Model: sam2_hiera_{self.model_size}")
 
     def _load_sam2_image_predictor(self):
         """SAM 2 Image Predictor を読み込み"""
@@ -522,13 +632,15 @@ class RobustVideoSegmentation:
 
                         mask = (mask * 255).astype(np.uint8)
 
-                        # 後処理
-                        mask = self.post_processor.process(mask)
+                        # 後処理（Guided Filterにフレームを渡す）
+                        mask = self.post_processor.process(mask, guide_image=frame)
                     else:
                         mask = np.zeros((height, width), dtype=np.uint8)
 
-                    # 合成
+                    # 合成（滑らかなアルファブレンド）
                     alpha = mask.astype(np.float32) / 255.0
+                    # エッジを少しぼかして滑らかに
+                    alpha = cv2.GaussianBlur(alpha, (3, 3), 0)
                     alpha = alpha[:, :, np.newaxis]
                     composite = (frame.astype(np.float32) * alpha +
                                 bg_frame.astype(np.float32) * (1 - alpha)).astype(np.uint8)
